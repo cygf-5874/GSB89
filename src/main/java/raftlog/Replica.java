@@ -18,6 +18,7 @@ public final class Replica {
     private long currentTerm;
     private Long votedFor;
     private List<Long> members;
+    private long commitIndex;
 
     /**
      * 以本节点 id 与初始成员集合（有序）构造。
@@ -57,7 +58,7 @@ public final class Replica {
 
     /** 当前提交下标；空日志上为 0。 */
     public long commitIndex() {
-        throw new UnsupportedOperationException("commitIndex 尚未实现");
+        return commitIndex;
     }
 
     /**
@@ -67,7 +68,48 @@ public final class Replica {
      * @return 本节点的判定结果
      */
     public AppendResult appendEntries(AppendRequest req) {
-        throw new UnsupportedOperationException("appendEntries 尚未实现");
+        if (req.term() < currentTerm) {
+            return new AppendResult(currentTerm, false, -1L, commitIndex, members);
+        }
+        if (req.term() > currentTerm) {
+            currentTerm = req.term();
+            votedFor = null;
+        }
+
+        if (req.members() != null && !jointMajority(members, req.members())) {
+            return new AppendResult(currentTerm, false, -1L, commitIndex, members);
+        }
+
+        if (!prevMatches(req.prevLogIndex(), req.prevLogTerm())) {
+            return new AppendResult(currentTerm, false,
+                    conflictIndex(req.prevLogIndex()), commitIndex, members);
+        }
+
+        List<Entry> incoming = req.entries();
+        for (int i = 0; i < incoming.size(); i++) {
+            Entry e = incoming.get(i);
+            Entry local = log.at(e.index());
+            if (local != null && local.term() == e.term()) {
+                continue;
+            }
+            if (e.index() <= commitIndex) {
+                continue;
+            }
+            log.truncateFrom(e.index());
+            log.appendAll(incoming.subList(i, incoming.size()));
+            break;
+        }
+
+        long advanced = Math.min(req.leaderCommit(), log.lastIndex());
+        if (advanced > commitIndex) {
+            commitIndex = advanced;
+        }
+
+        if (req.members() != null) {
+            members = req.members();
+        }
+
+        return new AppendResult(currentTerm, true, -1L, commitIndex, members);
     }
 
     /**
@@ -77,7 +119,73 @@ public final class Replica {
      * @return 生效后的成员集合
      */
     public List<Long> applyMembership(List<Long> newMembers) {
-        throw new UnsupportedOperationException("applyMembership 尚未实现");
+        if (newMembers == null || newMembers.isEmpty()) {
+            throw new LogException("成员集合不能为 null 或空");
+        }
+        for (int i = 0; i < newMembers.size(); i++) {
+            Long id = newMembers.get(i);
+            if (id == null) {
+                throw new LogException("成员 id 不能为 null");
+            }
+            for (int j = 0; j < i; j++) {
+                if (id.equals(newMembers.get(j))) {
+                    throw new LogException("成员 id 重复：" + id);
+                }
+            }
+        }
+        if (!jointMajority(members, newMembers)) {
+            throw new LogException("新旧成员集合不满足联合多数派");
+        }
+        members = List.copyOf(newMembers);
+        return members;
+    }
+
+    /** 本地在 prevLogIndex 处是否存在 term 等于 prevLogTerm 的条目（下标 0 是哨兵）。 */
+    private boolean prevMatches(long prevLogIndex, long prevLogTerm) {
+        if (prevLogIndex == 0L) {
+            return prevLogTerm == 0L;
+        }
+        Entry local = log.at(prevLogIndex);
+        return local != null && local.term() == prevLogTerm;
+    }
+
+    /**
+     * prev 匹配失败时的优化回退下标：本地比 prevLogIndex 短时退到 lastIndex() + 1；
+     * 否则退到本地在 prevLogIndex 那条 entry 的同 term 连续段的起点。
+     */
+    private long conflictIndex(long prevLogIndex) {
+        long lastIndex = log.lastIndex();
+        if (prevLogIndex > lastIndex) {
+            return lastIndex + 1;
+        }
+        if (prevLogIndex <= 0L) {
+            return 1L;
+        }
+        long term = log.termAt(prevLogIndex);
+        long first = prevLogIndex;
+        while (first > 1L && log.termAt(first - 1) == term) {
+            first--;
+        }
+        return first;
+    }
+
+    /** 结构上的联合多数派：交集同时覆盖旧、新两个集合各自的过半（size / 2 + 1）。 */
+    private static boolean jointMajority(List<Long> oldMembers, List<Long> newMembers) {
+        long intersection = 0L;
+        List<Long> counted = new java.util.ArrayList<>();
+        for (Long id : newMembers) {
+            if (id != null && !counted.contains(id) && oldMembers.contains(id)) {
+                counted.add(id);
+                intersection++;
+            }
+        }
+        return intersection >= majority(oldMembers.size())
+                && intersection >= majority(newMembers.size());
+    }
+
+    /** 过半判据：n / 2 + 1。 */
+    private static long majority(long n) {
+        return n / 2 + 1;
     }
 
     /** 一次日志复制请求。 */
